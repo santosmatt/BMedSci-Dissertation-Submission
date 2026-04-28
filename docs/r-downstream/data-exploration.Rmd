@@ -1,0 +1,1224 @@
+---
+title: "Dissertation Data Exploration"
+author: "B249217"
+date: "2026-02-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r package-loading}
+pacman::p_load(tidyverse,here, ggsurvfit, gt, glmnet, randomForestSRC, survival, rsample, patchwork, showtext, sysfonts)
+```
+
+```{r consistent text-theme}
+
+font_add("Arial", regular = "Arial.ttf") 
+showtext_auto()
+showtext_opts(dpi = 300) 
+
+```
+
+
+```{r loading-data, include=FALSE}
+
+luad_raw <- read_csv(here("data", "LUADbinaryEncoding2000genes.csv"))
+
+all_clinical_data <- read_tsv(here("data", "clinical_PANCAN_patient_with_followup.tsv"))
+
+luad_top10_weighting_raw <- read_csv(here("data", "luad_esm2_attention10_2000genes.csv"))
+
+esm2_p_values <- read_csv(here("data", "luad_esm2_p_values.csv"))
+
+```
+
+
+```{r tidying metadata, include=FALSE}
+
+luad_clinical_data <- all_clinical_data %>% 
+  filter(acronym == "LUAD") %>% 
+  mutate(across(where(is.character), ~if_else(
+    str_detect(.x, regex("(Not Applicable|Available)")) | .x == "",
+    NA_character_,
+    .x))) %>% 
+  select(where(~ !all(is.na(.)))) %>% 
+  mutate(days_to_last_followup = as.numeric(days_to_last_followup),
+         days_to_death = as.numeric(days_to_death),
+         status = if_else(vital_status == "Alive", 0, 1),
+         time = if_else(vital_status == "Alive", days_to_last_followup, days_to_death)) %>% 
+  filter(!(time <= 0)) %>% #removes all people with no follow up even one dead
+  filter(!is.na(time))
+
+luad_clinical_features <- luad_clinical_data %>%
+  mutate(pathologic_stage = case_when(
+    pathologic_stage %in% c("Stage I", "Stage IA", "Stage IB") ~ "Stage I",
+    pathologic_stage %in% c("Stage II", "Stage IIA", "Stage IIB") ~ "Stage II",
+    pathologic_stage %in% c("Stage IIIA", "Stage IIIB") ~ "Stage III",
+    pathologic_stage %in% c("Stage IV") ~ "Stage IV"),
+    
+    tobacco_smoking_history = case_when( 
+      tobacco_smoking_history %in% 
+        c("Lifelong Non-smoker") ~ "Non-smoker",
+      tobacco_smoking_history %in% 
+        c("Current reformed smoker for > 15 years", 
+          "Current reformed smoker for < or = 15 years", 
+          "Current Reformed Smoker, Duration Not Specified") ~ "Former smoker",
+      tobacco_smoking_history %in% 
+        c("Current smoker") ~ "Current smoker"),
+    age_at_initial_pathologic_diagnosis = as.numeric(age_at_initial_pathologic_diagnosis)
+  ) %>% 
+  select(bcr_patient_barcode, gender, age_at_initial_pathologic_diagnosis, pathologic_stage, tobacco_smoking_history, status, time) %>% 
+  mutate(across(c(gender, pathologic_stage, tobacco_smoking_history), as.factor)) %>% 
+  drop_na()
+
+```
+
+```{r cleaning-luad-data}
+
+luad_clean <- luad_raw %>% 
+  mutate(sample_code = substr(samples, 14, 15),
+         samples = substr(samples, 1, 12)) %>% 
+  filter(sample_code == "01") %>% 
+  group_by(samples) %>% 
+  slice(1) %>% 
+  ungroup() %>% 
+  inner_join(luad_clinical_features %>% select(time, status, bcr_patient_barcode),
+             join_by(samples == bcr_patient_barcode)) %>% 
+  filter(!is.na(time)) %>% 
+  select(-sample_code)
+
+```
+
+```{r cleaning-esm2-embeddings-data}
+
+luad_top10_weighting <- luad_top10_weighting_raw %>% 
+  mutate(sample_code = substr(samples, 14, 15),
+         samples = substr(samples, 1, 12)) %>% 
+  filter(sample_code == "01") %>% 
+  group_by(samples) %>% 
+  slice(1) %>% 
+  ungroup() %>% 
+  inner_join(luad_clinical_features %>% select(time, status, bcr_patient_barcode),
+             join_by(samples == bcr_patient_barcode)) %>% 
+  filter(!is.na(time)) %>% 
+  select(-sample_code)
+
+```
+
+
+```{r demographic-data}
+#ensuring same patients in mutation and clinical data
+
+luad_clinical_features_filtered <- luad_clinical_features %>% 
+  inner_join(luad_clean %>% select(samples),
+             join_by(bcr_patient_barcode == samples)) %>% 
+  rename(samples = bcr_patient_barcode)
+
+luad_clinical_features_filtered_5year <- luad_clinical_features_filtered %>% 
+  censor_time_at(365.25 * 5)
+
+
+group_sizes <- luad_clinical_features_filtered_5year %>%
+  count(status) %>%
+  mutate(label = paste0("n=", n)) %>%
+  deframe()
+
+categorical_table <- luad_clinical_features_filtered_5year %>%
+  select(status, gender, pathologic_stage, tobacco_smoking_history) %>%
+  pivot_longer(-status, names_to = "variable", values_to = "value") %>%
+  mutate(
+    value = case_when(
+      variable == "pathologic_stage" ~ factor(
+        value, levels = c("Stage I", "Stage II", "Stage III", "Stage IV")
+      ) %>% as.character(),
+      variable == "tobacco_smoking_history" ~ factor(
+        value, levels = c("Non-smoker", "Former smoker", "Current smoker")
+      ) %>% as.character(),
+      TRUE ~ value
+    )
+  ) %>%
+  group_by(variable, status) %>%
+  count(value) %>%
+  mutate(
+    percent = round(n / sum(n) * 100, 1),
+    display = paste0(n, " (", percent, "%)")
+  ) %>%
+  ungroup() %>%
+  select(variable, value, status, display) %>%
+  pivot_wider(names_from = status, values_from = display)
+
+continuous_table <- luad_clinical_features_filtered_5year %>%
+  group_by(status) %>%
+  summarise(
+    age = paste0(
+      round(median(age_at_initial_pathologic_diagnosis, na.rm = TRUE), 1),
+      " (", round(quantile(age_at_initial_pathologic_diagnosis, 0.25, na.rm = TRUE), 1),
+      "–", round(quantile(age_at_initial_pathologic_diagnosis, 0.75, na.rm = TRUE), 1), ")"
+    ),
+    follow_up = paste0(
+      round(median(time / 30.4375, na.rm = TRUE), 1),
+      " (", round(quantile(time / 30.4375, 0.25, na.rm = TRUE), 1),
+      "–", round(quantile(time / 30.4375, 0.75, na.rm = TRUE), 1), ")"
+    )
+  ) %>%
+  pivot_longer(-status, names_to = "variable", values_to = "value") %>%
+  pivot_wider(names_from = status, values_from = value) %>%
+  mutate(value = "")
+
+p_values <- tibble(
+  variable = c("gender", "pathologic_stage", "tobacco_smoking_history", "age", "follow_up"),
+  p_value = c(
+    chisq.test(table(luad_clinical_features_filtered_5year$gender,
+                     luad_clinical_features_filtered_5year$status))$p.value,
+    chisq.test(table(luad_clinical_features_filtered_5year$pathologic_stage,
+                     luad_clinical_features_filtered_5year$status))$p.value,
+    chisq.test(table(luad_clinical_features_filtered_5year$tobacco_smoking_history,
+                     luad_clinical_features_filtered_5year$status))$p.value,
+    wilcox.test(age_at_initial_pathologic_diagnosis ~ status,
+                data = luad_clinical_features_filtered_5year)$p.value,
+    NA_real_
+  )
+) %>%
+  mutate(
+    p_value = case_when(
+      is.na(p_value) ~ "—",
+      p_value < 0.001 ~ "<0.001",
+      TRUE ~ sprintf("%.3f", p_value)
+    )
+  )
+
+# Define display order for rows within each group
+variable_order <- c(
+  "gender", "pathologic_stage", "tobacco_smoking_history", "age", "follow_up"
+)
+
+survived_col   <- paste0("Survived (n = ",     group_sizes["0"], ")")
+deceased_col   <- paste0("Deceased (n = ",     group_sizes["1"], ")")
+
+final_table <- bind_rows(categorical_table, continuous_table) %>%
+  left_join(p_values, by = "variable") %>%
+  mutate(
+    variable = recode(variable,
+                      gender               = "Gender",
+                      pathologic_stage     = "Tumour Stage",
+                      tobacco_smoking_history = "Smoking History",
+                      age                  = "Age at Diagnosis (years)",
+                      follow_up            = "Follow-up (months)"
+    )
+  ) %>%
+  rename(
+    !!survived_col := `0`,
+    !!deceased_col := `1`
+  )
+
+demo_table <- final_table %>%
+  gt(rowname_col = "value", groupname_col = "variable") %>%
+  
+  cols_label(
+    value   = "Category",
+    p_value = md("*p*-value")     
+  ) %>%
+  
+  cols_align(align = "center", columns = -value) %>%
+  cols_align(align = "left",   columns = value) %>%
+  
+  tab_header(
+    title    = "Baseline Clinical Characteristics by Survival Status at 5 Years",
+    subtitle = md("Values are count (%) or median (IQR). *p*-values from chi-squred or Wilcoxon rank-sum test.")
+  ) %>%
+  
+  tab_style(
+    locations = cells_column_labels(columns = everything()),
+    style     = list(
+      cell_borders(sides = "bottom", weight = px(2)),
+      cell_text(weight = "bold")
+    )
+  ) %>%
+  
+  tab_style(
+    locations = cells_title(groups = "title"),
+    style     = cell_text(weight = "bold", size = 14)
+  ) %>%
+  
+  tab_style(
+    locations = cells_title(groups = "subtitle"),
+    style     = cell_text(size = 11, color = "grey30")
+  ) %>%
+  tab_style(
+    locations = cells_row_groups(),
+    style     = list(
+      cell_fill(color = "#f5f5f5"),
+      cell_text(weight = "bold", style = "normal", size = 12),
+      cell_borders(sides = c("top", "bottom"), weight = px(1), color = "grey80")
+    )
+  ) %>%
+  tab_style(
+    locations = cells_stub(),
+    style     = cell_text(indent = px(12))  
+  ) %>%
+  
+  opt_table_font(font = "Arial") %>%  
+  opt_stylize(style = 1, color = "gray") %>%
+  
+  tab_options(
+    table.font.size        = px(11),  
+    table.font.names       = "Arial",
+    data_row.padding       = px(5),
+    table.border.top.width = px(2),
+    table.border.bottom.width   = px(2),
+    table_body.border.bottom.width = px(2),
+    column_labels.border.top.width = px(0)
+  )
+
+demo_table
+gtsave(demo_table, "table_1.png", vwidth = 900, vheight = 600, zoom = 2)
+```
+
+
+
+```{r basic-survial-plot}
+
+survfit2(Surv(time, status) ~ 1, data = luad_clinical_data) %>% 
+  ggsurvfit() +
+  add_confidence_interval() +
+  labs(title = "Overall Survival Over Time",
+       x = "Time(days)")
+```
+
+```{r basic-survial-plot-funciton}
+
+create_survial_plot <- function(data, grouping){
+  survfit2(Surv(time, status) ~ grouping, data = data) %>% 
+    ggsurvfit() +
+    add_confidence_interval()
+}
+
+```
+
+
+```{r survial-plot-sex}
+
+survfit2(Surv(time, status) ~ gender, data = luad_clinical_data) %>% 
+  ggsurvfit() +
+  add_confidence_interval() +
+  labs(title = "Overall Survival Over Time",
+       subtitle = "By Gender",
+       x = "Time(days)",
+       color = "Sex",
+       fill = "Sex")
+
+```
+
+
+```{r time-alpha-setting}
+
+time_horizons <- c(
+  "3yr" = 3 * 365.25,
+  "5yr" = 5 * 365.25
+)
+
+alpha_grid <- c(0, 0.25, 0.5, 0.75, 1)
+
+```
+
+
+```{r weighted embeddings}
+
+triangular_weights <- tibble(
+  top    = paste0("top", 1:10),
+  weight = c(10/55, 9/55, 8/55, 7/55, 6/55, 5/55, 4/55, 3/55, 2/55, 1/55) 
+)
+
+weights <- tibble(
+  top    = paste0("top", 1:10),
+  weight = c(1/10, 1/10, 1/10, 1/10, 1/10, 1/10, 1/10, 1/10, 1/10, 1/10) 
+)
+
+calculate_weighted_embeddings <- function(data, weights = NULL){
+  data %>%
+    rename_with(tolower, matches("\\.top\\d+$", ignore.case = TRUE)) %>%
+    pivot_longer(
+      cols         = matches("\\.top\\d+$"),
+      names_to     = c("gene", "top"),
+      names_pattern = "(?i)^(.*?)\\.(top\\d+)$"
+    ) %>%
+    left_join(weights, by = "top") %>%
+    group_by(samples, gene) %>%
+    summarise(
+      weighted_avg = sum(value * weight) / sum(weight), 
+      .groups = "drop"
+    ) %>%
+    pivot_wider(
+      names_from = gene,
+      values_from = weighted_avg,
+      names_glue = "{gene}_weighted_avg"
+    )} 
+
+luad_esm2_wavg <- calculate_weighted_embeddings(luad_top10_weighting, weights) %>% 
+  inner_join(luad_clinical_features_filtered %>% select(samples,time,status),
+             join_by(samples))
+#luad_esm2_wavg <- calculate_weighted_embeddings(luad_top10_weighting, triangular_weights)
+
+```
+
+```{r utility-functions}
+
+censor_time_at <- function(data, cutoff = 3652.5/2){
+  data %>% 
+    mutate(status = ifelse(time <= cutoff & status == 1, 1, 0),
+           time = pmin(time, cutoff))
+}
+
+prepare_matrix <- function(data) {
+  x <- model.matrix(~ . - time - status - samples, data = data)[, -1]
+  
+  y <- Surv(data$time, data$status)
+  list(x = x, y = y)
+}
+```
+
+```{r feature-selection}
+
+select_features_cox <- function(data, cutoff = 5*365.25, p_threshold = 0.05){
+  data <- censor_time_at(data, cutoff)
+  features <- setdiff(names(data), c("time", "status", "samples"))
+  
+  result <- map(features, function(feat) {
+    formula <- as.formula(paste("Surv(time, status) ~", paste0("`", feat, "`")))
+    fit <- coxph(formula, data = data)
+    if (is.null(fit)) return(NULL)
+    s <- summary(fit)
+    tibble(
+      feature  = feat,
+      hr       = s$coefficients[1, "exp(coef)"],
+      hr_lower = s$conf.int[1, "lower .95"],
+      hr_upper = s$conf.int[1, "upper .95"],
+      p_value  = s$coefficients[1, "Pr(>|z|)"],
+      year     = cutoff/365.25
+    )
+  }) %>% 
+    list_rbind() %>% 
+    mutate(p_adj = p.adjust(p_value, method = "BH")) %>% 
+    arrange(p_adj)
+  
+  if (nrow(result) == 0) return(list(all = tibble(), selected = tibble()))
+  
+  # Selection logic (unchanged)
+  selected <- if (any(result$feature == "pathologic_stage")) {
+    result
+  } else if (any(result$p_value < p_threshold)) {
+    result %>% filter(p_value < p_threshold)
+  } else {
+    result %>% slice_head(n = 10)
+  }
+  
+  # Return both — all stats for plotting, filtered for modelling
+  list(all = result, selected = selected)
+}
+
+```
+
+```{r create-feature-set}
+plan(sequential)
+create_feature_sets <- function(clinical, binary, esm2_wavg,
+                                sel_binary, sel_esm2,
+                                cutoff) {
+  
+  # Censor all base sets to this horizon
+  clinical_c <- censor_time_at(clinical, cutoff)
+  binary_c   <- censor_time_at(binary,   cutoff)
+  esm2_c     <- censor_time_at(esm2_wavg, cutoff)
+  
+  binary_cols <- intersect(sel_binary, names(binary_c))
+  esm2_cols   <- intersect(sel_esm2,   names(esm2_c))
+  
+  list(
+    clinical = clinical_c,
+    
+    clinical_binary = clinical_c %>%
+      left_join(
+        binary_c %>% select(samples, all_of(binary_cols)),
+        by = "samples"
+      ),
+    
+    clinical_esm2 = clinical_c %>%
+      left_join(
+        esm2_c %>% select(samples, all_of(esm2_cols)),
+        by = "samples"
+      ),
+    
+    combined = clinical_c %>%
+      left_join(
+        binary_c %>% select(samples, all_of(binary_cols)),
+        by = "samples"
+      ) %>%
+      left_join(
+        esm2_c %>% select(samples, all_of(esm2_cols)),
+        by = "samples"
+      )
+  )
+}
+
+```
+
+```{r model-fitting-functions}
+
+fit_cox <- function(train_data) {
+  train_data <- train_data %>% select(-samples)
+  features   <- setdiff(names(train_data), c("time", "status"))
+  formula    <- as.formula(
+    paste("Surv(time, status) ~", paste0("`", features, "`", collapse = " + "))
+  )
+  coxph(formula, data = train_data)
+}
+
+fit_glmnet <- function(train_data, alpha = 1) {
+  prep   <- prepare_matrix(train_data)
+  cv_fit <- cv.glmnet(prep$x, prep$y, family = "cox", alpha = alpha)
+  cv_fit
+}
+
+fit_rsf <- function(train_data, seed = 318) {
+  train_data <- train_data %>%
+    select(-samples) %>%
+    mutate(across(where(is.character), as.factor))
+  features <- setdiff(names(train_data), c("time", "status")) %>%
+    paste0("`", ., "`")
+  formula <- as.formula(
+    paste("Surv(time, status) ~", paste(features, collapse = " + "))
+  )
+  rfsrc(
+    formula,
+    data      = as.data.frame(train_data),
+    ntree     = 500,
+    nodesize  = 5,
+    seed      = seed,
+    importance = TRUE
+  )
+}
+```
+
+```{r functions-model-evaluation}
+
+calculate_cindex_cox <- function(model, test_data) {
+  lp <- predict(model, newdata = test_data, type = "lp")
+  risk <- -as.numeric(lp)
+  concordance(Surv(test_data$time, test_data$status) ~ risk)$concordance
+}
+
+calculate_cindex_glmnet <- function(model, test_data) {
+  prep <- prepare_matrix(test_data)
+  lp   <- as.numeric(predict(model, newx = prep$x, s = "lambda.min"))
+  risk <- -as.numeric(lp)
+  concordance(Surv(test_data$time, test_data$status) ~ risk)$concordance
+}
+
+calculate_cindex_rsf <- function(model, test_data) {
+  pred <- predict(model, newdata = as.data.frame(test_data))
+  risk <- -(pred$chf[, ncol(pred$chf)])
+  concordance(Surv(test_data$time, test_data$status) ~ risk)$concordance
+}
+```
+
+
+```{r alpha-tuning-function}
+tune_alpha <- function(train_data, sel_feats, alpha_grid, n_folds = 3) {
+  
+  if (length(sel_feats) == 0) return(list(alpha = 1, mean_c = NA_real_))
+  
+  tr_fs <- train_data %>%
+    select(samples, time, status, all_of(intersect(sel_feats, names(train_data))))
+  
+  # Guard: need enough events for inner CV
+  if (sum(tr_fs$status) < n_folds * 2) return(list(alpha = 1, mean_c = NA_real_))
+  
+  folds <- vfold_cv(tr_fs, v = n_folds, strata = status)
+  
+  results <- map(alpha_grid, function(a) {
+    fold_perf <- map_dbl(folds$splits, function(split) {
+      tr_inner  <- analysis(split)
+      val_inner <- assessment(split)
+      
+      # Guard against empty inner folds
+      if (sum(tr_inner$status) < 3 || sum(val_inner$status) < 1) return(NA_real_)
+      
+      fit <- tryCatch(fit_glmnet(tr_inner, alpha = a), error = function(e) NULL)
+      if (is.null(fit)) return(NA_real_)
+      
+      tryCatch(calculate_cindex_glmnet(fit, val_inner), error = function(e) NA_real_)
+    })
+    tibble(alpha = a, mean_c = mean(fold_perf, na.rm = TRUE))
+  }) %>% list_rbind()
+  
+  best <- results %>%
+    filter(!is.na(mean_c)) %>%
+    slice_max(mean_c, n = 1, with_ties = FALSE)
+  
+  if (nrow(best) == 0) return(list(alpha = 1, mean_c = NA_real_))
+  as.list(best)
+}
+```
+
+```{r outer-folds}
+set.seed(318)
+
+outer_folds <- vfold_cv(luad_clean, v = 5, strata = status)
+
+library(future)
+library(furrr)
+
+plan(multisession, workers = 8)
+
+```
+
+```{r cv}
+
+nested_results_test <- future_map(seq_along(outer_folds$splits) , function(fold_i) {
+  message("Outer fold ", fold_i, " of ", nrow(outer_folds))
+  outer_split <- outer_folds$splits[[fold_i]]
+  
+  outer_train_ids <- analysis(outer_split)$samples
+  outer_test_ids  <- assessment(outer_split)$samples
+  
+  # Pull each data source for this fold
+  train_binary   <- luad_clean %>% filter(samples %in% outer_train_ids)
+  test_binary    <- luad_clean %>% filter(samples %in% outer_test_ids)
+  
+  train_clinical <- luad_clinical_features_filtered %>%
+    filter(samples %in% outer_train_ids)
+  test_clinical  <- luad_clinical_features_filtered %>%
+    filter(samples %in% outer_test_ids)
+  
+  train_esm2 <- luad_esm2_wavg %>% filter(samples %in% outer_train_ids)
+  test_esm2  <- luad_esm2_wavg %>% filter(samples %in% outer_test_ids)
+  
+  map(names(time_horizons), function(t_name) {
+    
+    cutoff <- as.numeric(time_horizons[[t_name]])
+    message("  Time horizon: ", t_name)
+    
+    sel_bin_out <- select_features_cox(train_binary, cutoff)
+    sel_esm_out <- select_features_cox(train_esm2,   cutoff)
+    
+    # For modelling (unchanged behaviour)
+    sel_bin <- sel_bin_out$selected$feature
+    sel_esm <- sel_esm_out$selected$feature
+    
+    # For tracking — now uses ALL features, not just significant ones
+    feature_tracking <- bind_rows(
+      sel_bin_out$all %>% mutate(source = "binary"),
+      sel_esm_out$all %>% mutate(source = "esm2")
+    ) %>%
+      mutate(fold = fold_i, time_horizon = t_name)
+    # Clinical features always selected by select_features_cox logic
+    # (pathologic_stage anchor means all clinical features are returned)
+    
+    # Build feature sets — data is censored inside this function
+    train_sets <- create_feature_sets(
+      train_clinical, train_binary, train_esm2,
+      sel_bin, sel_esm, cutoff
+    )
+    test_sets <- create_feature_sets(
+      test_clinical, test_binary, test_esm2,
+      sel_bin, sel_esm, cutoff
+    )
+    
+    map(names(train_sets), function(fs) {
+      
+      message("    Feature set: ", fs)
+      tr <- train_sets[[fs]]
+      te <- test_sets[[fs]]
+      
+      message("---- DEBUG ----")
+      message("Fold: ", fold_i,
+              " | FS: ", fs,
+              " | Horizon: ", t_name)
+      
+      message("Train events: ", sum(tr$status))
+      message("Test events: ", sum(te$status))
+      message("Num features: ", ncol(tr) - 3)
+      
+      # Require at least time + status + 1 predictor + 2 events in train
+      n_events <- sum(tr$status == 1, na.rm = TRUE)
+      n_feats  <- ncol(tr) - 3  # subtract samples, time, status
+      if (n_feats == 0 || n_events < 5) {
+        message("    Skipping — insufficient features or events")
+        return(NULL)
+      }
+      
+      # Features available in this set (excludes samples/time/status)
+      feats_in_set <- setdiff(names(tr), c("samples", "time", "status"))
+      
+      best_alpha <- tune_alpha(tr, feats_in_set, alpha_grid, 3)$alpha
+      message("    Best alpha: ", best_alpha)
+      
+      # Fit models — data already censored, no further censoring needed
+      cox_fit <- tryCatch(fit_cox(tr),               error = function(e) NULL)
+      glm_fit <- tryCatch(fit_glmnet(tr, best_alpha), error = function(e) NULL)
+      rsf_fit <- tryCatch(fit_rsf(tr),               error = function(e) NULL)
+      
+      # Evaluate on test set (also pre-censored at same cutoff)
+      cox_c <- if (!is.null(cox_fit))
+        tryCatch(calculate_cindex_cox(cox_fit, te),    error = function(e) NA_real_)
+      else NA_real_
+      
+      glm_c <- if (!is.null(glm_fit))
+        tryCatch(calculate_cindex_glmnet(glm_fit, te), error = function(e) NA_real_)
+      else NA_real_
+      
+      rsf_c <- if (!is.null(rsf_fit))
+        tryCatch(calculate_cindex_rsf(rsf_fit, te),    error = function(e) NA_real_)
+      else NA_real_
+      
+      # --- Predictions ---
+      predictions <- list()
+      
+      if (!is.null(cox_fit)) {
+        lp <- predict(cox_fit, newdata = te, type = "lp")
+        predictions$cox <- tibble(
+          samples = te$samples,
+          risk = as.numeric(lp),
+          model = "cox"
+        )
+      }
+      
+      if (!is.null(glm_fit)) {
+        prep_te <- prepare_matrix(te)
+        lp <- predict(glm_fit, newx = prep_te$x, s = "lambda.min")
+        predictions$glmnet <- tibble(
+          samples = te$samples,
+          risk = as.numeric(lp),
+          model = "glmnet"
+        )
+      }
+      
+      if (!is.null(rsf_fit)) {
+        pred <- predict(rsf_fit, newdata = as.data.frame(te))
+        predictions$rsf <- tibble(
+          samples = te$samples,
+          risk = pred$predicted,
+          model = "rsf"
+        )
+      }
+      
+      pred_df <- bind_rows(predictions) %>%
+        mutate(
+          fold = fold_i,
+          time_horizon = t_name,
+          feature_set = fs
+        ) %>%
+        left_join(te %>% select(samples, time, status), by = "samples")
+      
+      if (!is.null(pred_df)) {
+        message("Risk summary:")
+        print(summary(pred_df$risk))
+      }
+      
+      if (!is.null(pred_df)) {
+        c1 <- concordance(Surv(time, status) ~ risk, data = pred_df)$concordance
+        c2 <- concordance(Surv(time, status) ~ I(-risk), data = pred_df)$concordance
+        
+        message("C-index: ", round(c1, 3),
+                " | Flipped: ", round(c2, 3))
+      }
+      
+      #Feature Importance
+      importance_list <- list()
+      
+      # GLMNET: non-zero coefficients at lambda.min
+      if (!is.null(glm_fit)) {
+        coefs <- coef(glm_fit, s = "lambda.min")
+        coef_df <- as.data.frame(as.matrix(coefs))
+        colnames(coef_df) <- "coefficient"
+        coef_df$feature <- rownames(coef_df)
+        importance_list$glmnet <- coef_df %>%
+          filter(coefficient != 0, feature != "(Intercept)") %>%
+          transmute(
+            feature,
+            importance = abs(coefficient),
+            model      = "glmnet"
+          )
+      }
+      
+      # RSF: built-in variable importance
+      if (!is.null(rsf_fit)) {
+        imp <- rsf_fit$importance
+        importance_list$rsf <- tibble(
+          feature    = names(imp),
+          importance = as.numeric(imp),
+          model      = "rsf"
+        )
+      }
+      
+      importance_df <- bind_rows(importance_list) %>%
+        mutate(
+          fold         = fold_i,
+          time_horizon = t_name,
+          feature_set  = fs
+        )
+      list(
+        performance = tibble(
+          fold         = fold_i,
+          time_horizon = t_name,
+          feature_set  = fs,
+          best_alpha   = best_alpha,
+          n_train      = nrow(tr),
+          n_events     = n_events,
+          n_features   = n_feats,
+          cox_c        = cox_c,
+          glmnet_c     = glm_c,
+          rsf_c        = rsf_c
+        ),
+        
+        predictions = pred_df,
+        
+        features = tibble(
+          fold = fold_i,
+          time_horizon = t_name,
+          feature_set = fs,
+          feature = feats_in_set
+        ),
+        
+        pvals = feature_tracking,
+        
+        importance = importance_df
+      )
+    }) 
+    
+  }) 
+  
+}, .options = furrr_options(seed = 318))
+
+```
+
+```{r creating-results-dfs}
+plan(sequential)
+flat_results <- nested_results_test %>% 
+  flatten() %>% 
+  flatten() 
+
+performance <- map(flat_results, "performance") %>% list_rbind()
+predictions <- map(flat_results, "predictions") %>% list_rbind()
+features <- map(flat_results, "features") %>% list_rbind()
+pvals <- map(flat_results, "pvals") %>% list_rbind()
+importance <- map(flat_results, "importance") %>% list_rbind()
+
+pvals_unique <- pvals %>% 
+  distinct()
+
+```
+
+```{r result}
+
+results_final <- performance %>%
+  pivot_longer(
+    cols      = c(cox_c, glmnet_c, rsf_c),
+    names_to  = "model",
+    values_to = "c_index"
+  ) %>%
+  group_by(feature_set, model, time_horizon) %>%
+  summarise(
+    mean_c = mean(c_index,              na.rm = TRUE),
+    sd_c   = sd(c_index,               na.rm = TRUE),
+    lower  = quantile(c_index, 0.025,  na.rm = TRUE),
+    upper  = quantile(c_index, 0.975,  na.rm = TRUE),
+    n_folds_complete = sum(!is.na(c_index)),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_c))
+
+print(results_final)
+
+save(nested_results, results_final, nested_results_test, file = "cv_results.RData")
+load("cv_results.RData")
+
+save(nested_results_test, file = "cv_results_1.RData")
+load("cv_results_1.RData")
+
+```
+
+```{r consistent-graph-theme}
+
+theme_dissertation <- function() {
+  theme_minimal(base_size = 11, base_family = "Arial") +
+    theme(
+      #Text
+      plot.title       = element_text(face = "bold",   size = 11, family = "Arial"),
+      plot.subtitle    = element_text(colour = "grey40", size = 10, family = "Arial"),
+      axis.title       = element_text(size = 11, family = "Arial"),
+      axis.text        = element_text(size = 10, family = "Arial"),
+      legend.title     = element_text(face = "bold", size = 11, family = "Arial"),
+      legend.text      = element_text(size = 10, family = "Arial"),
+      strip.text       = element_text(face = "bold", size = 11, family = "Arial"),
+      
+      #Panel
+      strip.background  = element_rect(fill = "grey92", colour = NA),
+      panel.grid.minor  = element_blank(),
+      legend.position   = "bottom",
+      
+      # Margins — prevents clipping on Word export
+      plot.margin = margin(t = 8, r = 15, b = 8, l = 8, unit = "pt")
+    )
+}
+
+```
+
+
+```{r histogram-p-values}
+ggplot(pvals_unique, aes(x = p_value)) +
+  geom_histogram(bins = 30, fill = "steelblue", colour = "white") +
+  facet_grid(source ~ time_horizon) +
+  labs(
+    title = "",
+    x     = "p-value",
+    y     = "Count"
+  ) +
+  geom_vline(xintercept = 0.05, linetype = "dashed", colour = "grey50") +
+  theme_bw()
+
+pvals_unique %>%
+  group_by(feature, source, time_horizon) %>%
+  summarise(mean_p = mean(p_value, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(x = mean_p)) +
+  geom_histogram(bins = 30, fill = "steelblue", colour = "white") +
+  facet_wrap(source ~ time_horizon) +
+  geom_vline(xintercept = 0.05, linetype = "dashed", colour = "grey50") +
+  theme_bw()
+
+pvals_unique %>%
+  group_by(feature, source, time_horizon) %>%
+  summarise(mean_p = mean(p_adj, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(x = mean_p)) +
+  geom_histogram(aes(y = after_stat(count + 1)), bins = 30, fill = "steelblue", colour = "white") +
+  scale_y_continuous(trans = "log10") +
+  facet_wrap(source ~ time_horizon) +
+  geom_vline(xintercept = 0.05, linetype = "dashed", colour = "grey50") +
+  theme_bw() +
+  labs(y = "log10(count)",
+       x = "mean_p_adj")
+```
+
+
+```{r c-index-plot}
+
+library(ggsci)
+
+order_fs_forest_plot <- c("Clinical", "Clinical + Binary", "Clinical + ESM2", "Combined")
+  
+presentation_plots <- results_final %>% 
+  # filter(time_horizon == "5yr") %>% 
+  filter((model != "cox_c")) %>% 
+  mutate(feature_set = recode(feature_set,
+                              "clinical"        = "Clinical",
+                              "clinical_binary" = "Clinical + Binary",
+                              "clinical_esm2"   = "Clinical + ESM2",
+                              "combined"        = "Combined"),
+         feature_set = factor(feature_set, levels = order_fs_forest_plot),
+         time_horizon = recode(time_horizon,
+                               "3yr" = "3 Year",
+                               "5yr" = "5 Year"),
+         model = recode(model,
+                        "rsf_c" = "RSF",
+                        "glmnet_c" = "Penalised Cox"))
+
+
+presentation_plots %>% 
+  ggplot(aes(x = mean_c, y = feature_set,
+             shape = time_horizon, colour = time_horizon)) +
+  
+  # Reference line at chance
+  geom_vline(xintercept = 0.5,
+             linetype = "dashed",
+             colour = "grey50",
+             linewidth = 0.8) +
+  
+  # Confidence intervals
+  geom_errorbar(aes(xmin = lower, xmax = upper, colour = time_horizon),
+                width = 0.2,
+                linewidth = 1,
+                position = position_dodge(width = 0.5)) +
+  
+  # Points
+  geom_point(size = 3.5, 
+             position = position_dodge(width = 0.5)) +
+  
+
+  
+  facet_grid(~ model) +
+  
+  scale_x_continuous(
+    limits = c(0.45, 0.75),
+    breaks = seq(0.45, 0.75, 0.05),
+    labels = scales::number_format(accuracy = 0.01)) +
+  
+  scale_color_npg() +
+  labs(
+    title = "Model Performance Across Feature Sets and Time Horizons",
+    x = "C-index",
+    y = NULL,
+    subtitle = "C-index with 95% confidence intervals, dashed line indicates chance",
+    colour = "Prediction Horizon", 
+    shape = "Prediction Horizon") +
+  theme_dissertation()
+
+ggsave("figure_forest.png",
+       width = 7, height = 5, dpi = 300, bg = "white")
+
+```
+
+```{r prediction-model}
+
+risk_results <- predictions %>% 
+  
+  filter(model %in% c("rsf", "glmnet")) %>% 
+  
+  mutate(
+    feature_set = recode(feature_set,
+                         "clinical"        = "Clinical",
+                         "clinical_binary" = "Clinical + Binary",
+                         "clinical_esm2"   = "Clinical + ESM2",
+                         "combined"        = "Combined"
+    )
+  ) %>%
+  
+  filter(time_horizon %in% c("3yr", "5yr")) %>%
+  
+  group_by(model, feature_set, time_horizon, fold) %>%
+  mutate(risk_scaled = scale(risk)[,1]) %>%
+  ungroup() %>%
+  
+  group_by(model, feature_set, time_horizon) %>%
+  mutate(
+    group = ifelse(
+      risk_scaled > median(risk_scaled, na.rm = TRUE),
+      "High risk",
+      "Low risk"
+    )
+  ) %>%
+  ungroup()
+
+plots <- risk_results %>%
+  group_split(model, feature_set, time_horizon) %>%
+  map(~ {
+    
+    df <- .x
+    
+    fit <- survfit2(Surv(time, status) ~ group, data = df)
+    
+    ggsurvfit(fit) +
+      add_confidence_interval() +
+      add_pvalue() +
+      
+      labs(
+        title = paste(
+          unique(df$model),
+          "|",
+          unique(df$feature_set),
+          "|",
+          unique(df$time_horizon)
+        ),
+        x = "Time (years)",
+        y = "Survival probability"
+      ) +
+      
+      scale_color_manual(
+        values = c("Low risk" = "#1f77b4", "High risk" = "#d62728") 
+      ) +
+      
+      theme_bw()
+  })
+
+wrap_plots(plots)
+```
+
+```{r risk-one-per-feature-set}
+
+risk_results_fs <- predictions %>% 
+  
+  filter(model %in% c("rsf", "glmnet")) %>% 
+  filter((model == "glmnet" & feature_set == "clinical")|
+           (model == "rsf" & feature_set == "clinical_binary")|
+           (model == "rsf" & feature_set == "clinical_esm2")|
+           (model == "rsf" & feature_set == "combined")) %>% 
+  
+  mutate(
+    feature_set = recode(feature_set,
+                         "clinical"        = "Clinical",
+                         "clinical_binary" = "Clinical + Binary",
+                         "clinical_esm2"   = "Clinical + ESM2",
+                         "combined"        = "Combined"
+    ),
+    model = recode(model,
+                   "rsf"        = "RSF",
+                   "glmnet" = "Regularized Cox")) %>%
+  
+  filter(time_horizon %in% c("5yr")) %>%
+  
+  group_by(model, feature_set, time_horizon, fold) %>%
+  mutate(risk_scaled = scale(risk)[,1]) %>%
+  ungroup() %>%
+  
+  group_by(model, feature_set, time_horizon) %>%
+  mutate(
+    group = ifelse(
+      risk_scaled > median(risk_scaled, na.rm = TRUE),
+      "High risk",
+      "Low risk"
+    )
+  ) %>%
+  ungroup() %>% 
+  mutate(time_years = time / 365.25) 
+
+plots_feature_sets <- risk_results_fs %>%
+  group_split(model, feature_set) %>%
+  map(~ {
+    df  <- .x
+    fit <- survfit2(Surv(time_years, status) ~ group, data = df)
+
+    p <- ggsurvfit(fit, linewidth = 0.9, theme = theme_dissertation()) +
+      add_confidence_interval(alpha = 0.12) +
+      add_risktable(
+        risktable_stats = "n.risk",
+        theme = list(
+          theme_risktable_default(),
+          theme(
+            text      = element_text(family = "Arial", size = 10),
+            axis.text = element_text(family = "Arial", size = 10),
+            plot.title = element_text(family = "Arial", size = 10, face = "bold")
+          )
+        )
+      ) +
+      add_pvalue(
+        caption  = "Log-rank {p.value}",
+        location = "annotation",
+        x        = 0.05,
+        y        = 0.08,
+        size     = 10 / .pt,
+        hjust    = 0,
+        family   = "Arial"
+      ) +
+      scale_x_continuous(breaks = 0:5, limits = c(0, 5)) +
+      scale_color_manual(
+        values = c("Low risk" = "#1f78b4", "High risk" = "#e31a1c"),
+        name   = "Risk group"
+      ) +
+      scale_fill_manual(
+        values = c("Low risk" = "#1f78b4", "High risk" = "#e31a1c"),
+        name   = "Risk group"
+      ) +
+      labs(
+        title = paste0(unique(df$feature_set), " (", unique(df$model), ")"),
+        x     = "Time (years)",
+        y     = "Survival probability"
+      ) +
+      theme(
+        plot.title = element_text(
+          face   = "bold",
+          size   = 11,
+          family = "Arial",
+          hjust  = 0.5
+        )
+      )
+
+    ggplotify::as.ggplot(p)   
+  })
+
+km_plot <- wrap_plots(plots_feature_sets, ncol = 2, guides = "collect") +
+  plot_annotation(
+    title    = "Kaplan-Meier Survival Curves Stratified by Predicted Risk Group at 5 Years",
+    subtitle = "Patients separated into high and low risk groups by median predicted risk score",
+    theme    = theme(
+      plot.title    = element_text(face = "bold", size = 11, family = "Arial"),
+      plot.subtitle = element_text(colour = "grey40", size = 10, family = "Arial"),
+      legend.position = "bottom"),
+    tag_levels = "A"
+  ) 
+
+ggsave("figure_km.png",
+       plot = km_plot,
+       width = 10, height = 12, dpi = 300, bg = "white")
+
+```
+
+
+```{r top-features}
+clinical_features <- importance %>% 
+  filter(feature_set == "clinical") %>% 
+  pull(unique(feature)) %>% 
+  unique()
+
+top_features <- importance %>%
+  group_by(fold, time_horizon, feature_set, model) %>%
+  slice_max(importance, n = 15) %>%
+  ungroup()
+
+feature_stability <- top_features %>%
+  count(feature, model, feature_set, time_horizon, name = "n_folds_selected") %>%
+  arrange(desc(n_folds_selected)) %>% 
+  filter(feature_set == "clinical_binary"|
+           feature_set == "clinical_esm2") %>% 
+  filter(!(feature %in% clinical_features)) %>% 
+  filter(time_horizon == "5yr") %>% 
+  filter(n_folds_selected >= 3)
+
+feature_stability_plot <- feature_stability %>%
+  mutate(
+    feature_label = str_remove(feature, "_weighted_avg$"),
+    feature_label = str_replace_all(feature_label, "_", " "),
+    feature_label = str_to_upper(feature_label),
+    feature_set_label = case_when(
+      feature_set == "clinical_binary" ~ "Clinical + Binary",
+      feature_set == "clinical_esm2"   ~ "Clinical + ESM2",
+      TRUE ~ feature_set
+    ),
+    model_label = case_when(
+      model == "glmnet" ~ "Regularized Cox",
+      model == "rsf"    ~ "RSF",
+      TRUE ~ model
+    )
+  )
+
+feature_stability_plot %>%
+  ggplot(aes(
+    x    = n_folds_selected,
+    y    = tidytext::reorder_within(feature_label, n_folds_selected, feature_set_label),
+    fill = model_label
+  )) +
+  geom_col(
+    position  = position_dodge(width = 0.75),
+    width     = 0.65,
+    colour    = "white",
+    linewidth = 0.25
+  ) +
+  geom_vline(
+    xintercept = 1:5,
+    colour     = "grey90",
+    linewidth  = 0.4
+  ) +
+  scale_x_continuous(
+    breaks = 0:5,
+    limits = c(0, 5.5),
+    expand = c(0, 0),
+    name   = "Number of folds in which feature was selected (out of 5)"
+  ) +
+  tidytext::scale_y_reordered() +
+  scale_fill_npg() +
+  facet_wrap(
+    ~ feature_set_label,
+    nrow   = 2,
+    scales = "free_y"
+  ) +
+  labs(
+    y        = NULL,
+    fill     = "Model",
+    title    = "Feature Selection Stability Across Cross-Validation Folds at 5 Years",
+    subtitle = "Features selected in ≥ 3 of 5 outer folds shown, clinical features excluded"
+  ) +
+  theme_dissertation()            
+
+ggsave("figure_stability.png",
+       width = 7, height = 7, dpi = 300, bg = "white")
+```
+
